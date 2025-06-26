@@ -63,7 +63,6 @@ export async function fetchOpenGraphData(url: string): Promise<OpenGraphData> {
 			type: data.ogType,
 		}
 	} catch (error) {
-		console.error(`Error fetching Open Graph data for ${url}:`, error)
 		// Return basic information based on the URL
 		try {
 			const urlObj = new URL(url)
@@ -88,7 +87,7 @@ export async function fetchOpenGraphData(url: string): Promise<OpenGraphData> {
  * @param url The URL to check
  * @returns Promise resolving to boolean indicating if the URL is an image
  */
-export async function isImageUrl(url: string): Promise<boolean> {
+export async function detectImageUrl(url: string): Promise<boolean> {
 	try {
 		const response = await axios.head(url, {
 			headers: {
@@ -100,8 +99,7 @@ export async function isImageUrl(url: string): Promise<boolean> {
 		const contentType = response.headers["content-type"]
 		return contentType && contentType.startsWith("image/")
 	} catch (error) {
-		console.error(`Error checking if URL is an image: ${url}`, error)
 		// If we can't determine, fall back to checking the file extension
-		return /\.(jpg|jpeg|png|gif|webp|svg)$/i.test(url)
+		return /\.(jpg|jpeg|png|gif|webp|bmp|svg|tiff|tif|avif)$/i.test(url)
 	}
 }

@@ -1,18 +1,18 @@
 import { Anthropic } from "@anthropic-ai/sdk"
 import axios from "axios"
-import delay from "delay"
+import { setTimeout as setTimeoutPromise } from "node:timers/promises"
 import OpenAI from "openai"
-import { withRetry } from "../retry"
 import { ApiHandler } from "../"
-import { ApiHandlerOptions, ModelInfo, openRouterDefaultModelId, openRouterDefaultModelInfo } from "../../shared/api"
-import { streamOpenRouterFormatRequest } from "../transform/openrouter-stream"
-import { ApiStream } from "../transform/stream"
-import { convertToR1Format } from "../transform/r1-format"
+import { ApiHandlerOptions, ModelInfo, openRouterDefaultModelId, openRouterDefaultModelInfo } from "@shared/api"
+import { withRetry } from "../retry"
+import { createOpenRouterStream } from "../transform/openrouter-stream"
+import { ApiStream, ApiStreamUsageChunk } from "../transform/stream"
 import { OpenRouterErrorResponse } from "./types"
 
 export class OpenRouterHandler implements ApiHandler {
 	private options: ApiHandlerOptions
 	private client: OpenAI
+	lastGenerationId?: string
 
 	constructor(options: ApiHandlerOptions) {
 		this.options = options
@@ -28,36 +28,146 @@ export class OpenRouterHandler implements ApiHandler {
 
 	@withRetry()
 	async *createMessage(systemPrompt: string, messages: Anthropic.Messages.MessageParam[]): ApiStream {
-		const model = this.getModel()
-		const genId = yield* streamOpenRouterFormatRequest(
+		this.lastGenerationId = undefined
+
+		const stream = await createOpenRouterStream(
 			this.client,
 			systemPrompt,
 			messages,
-			model,
-			this.options.o3MiniReasoningEffort,
+			this.getModel(),
+			this.options.reasoningEffort,
 			this.options.thinkingBudgetTokens,
+			this.options.openRouterProviderSorting,
 		)
 
-		if (genId) {
-			await delay(500) // FIXME: necessary delay to ensure generation endpoint is ready
+		let didOutputUsage: boolean = false
+
+		for await (const chunk of stream) {
+			// openrouter returns an error object instead of the openai sdk throwing an error
+			// Check for error field directly on chunk
+			if ("error" in chunk) {
+				const error = chunk.error as OpenRouterErrorResponse["error"]
+				console.error(`OpenRouter API Error: ${error?.code} - ${error?.message}`)
+				// Include metadata in the error message if available
+				const metadataStr = error.metadata ? `\nMetadata: ${JSON.stringify(error.metadata, null, 2)}` : ""
+				throw new Error(`OpenRouter API Error ${error.code}: ${error.message}${metadataStr}`)
+			}
+
+			// Check for error in choices[0].finish_reason
+			// OpenRouter may return errors in a non-standard way within choices
+			const choice = chunk.choices?.[0]
+			// Use type assertion since OpenRouter uses non-standard "error" finish_reason
+			if ((choice?.finish_reason as string) === "error") {
+				// Use type assertion since OpenRouter adds non-standard error property
+				const choiceWithError = choice as any
+				if (choiceWithError.error) {
+					const error = choiceWithError.error
+					console.error(
+						`OpenRouter Mid-Stream Error: ${error?.code || "Unknown"} - ${error?.message || "Unknown error"}`,
+					)
+					// Format error details
+					const errorDetails = typeof error === "object" ? JSON.stringify(error, null, 2) : String(error)
+					throw new Error(`OpenRouter Mid-Stream Error: ${errorDetails}`)
+				} else {
+					// Fallback if error details are not available
+					throw new Error(
+						`OpenRouter Mid-Stream Error: Stream terminated with error status but no error details provided`,
+					)
+				}
+			}
+
+			if (!this.lastGenerationId && chunk.id) {
+				this.lastGenerationId = chunk.id
+			}
+
+			const delta = chunk.choices[0]?.delta
+			if (delta?.content) {
+				yield {
+					type: "text",
+					text: delta.content,
+				}
+			}
+
+			// Reasoning tokens are returned separately from the content
+			if ("reasoning" in delta && delta.reasoning) {
+				yield {
+					type: "reasoning",
+					// @ts-ignore-next-line
+					reasoning: delta.reasoning,
+				}
+			}
+
+			if (!didOutputUsage && chunk.usage) {
+				let modelId = this.options.openRouterModelId
+				if (modelId && modelId.includes("gemini")) {
+					yield {
+						type: "usage",
+						cacheWriteTokens: 0,
+						cacheReadTokens: chunk.usage.prompt_tokens_details?.cached_tokens || 0,
+						inputTokens: (chunk.usage.prompt_tokens || 0) - (chunk.usage.prompt_tokens_details?.cached_tokens || 0),
+						outputTokens: chunk.usage.completion_tokens || 0,
+						// @ts-ignore-next-line
+						totalCost: (chunk.usage.cost || 0) + (chunk.usage.cost_details?.upstream_inference_cost || 0),
+					}
+				} else {
+					yield {
+						type: "usage",
+						cacheWriteTokens: 0,
+						cacheReadTokens: chunk.usage.prompt_tokens_details?.cached_tokens || 0,
+						inputTokens: chunk.usage.prompt_tokens || 0,
+						outputTokens: chunk.usage.completion_tokens || 0,
+						// @ts-ignore-next-line
+						totalCost: (chunk.usage.cost || 0) + (chunk.usage.cost_details?.upstream_inference_cost || 0),
+					}
+				}
+				didOutputUsage = true
+			}
+		}
+
+		// Fallback to generation endpoint if usage chunk not returned
+		if (!didOutputUsage) {
+			const apiStreamUsage = await this.getApiStreamUsage()
+			if (apiStreamUsage) {
+				yield apiStreamUsage
+			}
+		}
+	}
+
+	async getApiStreamUsage(): Promise<ApiStreamUsageChunk | undefined> {
+		if (this.lastGenerationId) {
+			await setTimeoutPromise(500) // FIXME: necessary delay to ensure generation endpoint is ready
 			try {
-				const generationIterator = this.fetchGenerationDetails(genId)
+				const generationIterator = this.fetchGenerationDetails(this.lastGenerationId)
 				const generation = (await generationIterator.next()).value
 				// console.log("OpenRouter generation details:", generation)
-				yield {
-					type: "usage",
-					// cacheWriteTokens: 0,
-					// cacheReadTokens: 0,
-					// openrouter generation endpoint fails often
-					inputTokens: generation?.native_tokens_prompt || 0,
-					outputTokens: generation?.native_tokens_completion || 0,
-					totalCost: generation?.total_cost || 0,
+				let modelId = this.options.openRouterModelId
+				if (modelId && modelId.includes("gemini")) {
+					return {
+						type: "usage",
+						cacheWriteTokens: 0,
+						cacheReadTokens: generation?.native_tokens_cached || 0,
+						// openrouter generation endpoint fails often
+						inputTokens: (generation?.native_tokens_prompt || 0) - (generation?.native_tokens_cached || 0),
+						outputTokens: generation?.native_tokens_completion || 0,
+						totalCost: generation?.total_cost || 0,
+					}
+				} else {
+					return {
+						type: "usage",
+						cacheWriteTokens: 0,
+						cacheReadTokens: generation?.native_tokens_cached || 0,
+						// openrouter generation endpoint fails often
+						inputTokens: generation?.native_tokens_prompt || 0,
+						outputTokens: generation?.native_tokens_completion || 0,
+						totalCost: generation?.total_cost || 0,
+					}
 				}
 			} catch (error) {
 				// ignore if fails
 				console.error("Error fetching OpenRouter generation details:", error)
 			}
 		}
+		return undefined
 	}
 
 	@withRetry({ maxRetries: 4, baseDelay: 250, maxDelay: 1000, retryAllErrors: true })
@@ -68,7 +178,7 @@ export class OpenRouterHandler implements ApiHandler {
 				headers: {
 					Authorization: `Bearer ${this.options.openRouterApiKey}`,
 				},
-				timeout: 5_000, // this request hangs sometimes
+				timeout: 15_000, // this request hangs sometimes
 			})
 			yield response.data?.data
 		} catch (error) {
@@ -79,7 +189,10 @@ export class OpenRouterHandler implements ApiHandler {
 	}
 
 	getModel(): { id: string; info: ModelInfo } {
-		const modelId = this.options.openRouterModelId
+		let modelId = this.options.openRouterModelId
+		if (modelId === "x-ai/grok-3") {
+			modelId = "x-ai/grok-3-beta"
+		}
 		const modelInfo = this.options.openRouterModelInfo
 		if (modelId && modelInfo) {
 			return { id: modelId, info: modelInfo }

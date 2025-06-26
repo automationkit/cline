@@ -1,5 +1,5 @@
-import { ApiConfiguration, openRouterDefaultModelId } from "../../../src/shared/api"
-import { ModelInfo } from "../../../src/shared/api"
+import { ApiConfiguration, openRouterDefaultModelId, ModelInfo } from "@shared/api"
+
 export function validateApiConfiguration(apiConfiguration?: ApiConfiguration): string | undefined {
 	if (apiConfiguration) {
 		switch (apiConfiguration.apiProvider) {
@@ -48,6 +48,11 @@ export function validateApiConfiguration(apiConfiguration?: ApiConfiguration): s
 					return "You must provide a valid API key or choose a different provider."
 				}
 				break
+			case "doubao":
+				if (!apiConfiguration.doubaoApiKey) {
+					return "You must provide a valid API key or choose a different provider."
+				}
+				break
 			case "mistral":
 				if (!apiConfiguration.mistralApiKey) {
 					return "You must provide a valid API key or choose a different provider."
@@ -65,6 +70,11 @@ export function validateApiConfiguration(apiConfiguration?: ApiConfiguration): s
 				break
 			case "requesty":
 				if (!apiConfiguration.requestyApiKey || !apiConfiguration.requestyModelId) {
+					return "You must provide a valid API key or choose a different provider."
+				}
+				break
+			case "fireworks":
+				if (!apiConfiguration.fireworksApiKey || !apiConfiguration.fireworksModelId) {
 					return "You must provide a valid API key or choose a different provider."
 				}
 				break
@@ -88,9 +98,33 @@ export function validateApiConfiguration(apiConfiguration?: ApiConfiguration): s
 					return "You must provide a valid model selector."
 				}
 				break
+			case "nebius":
+				if (!apiConfiguration.nebiusApiKey) {
+					return "You must provide a valid API key or choose a different provider."
+				}
+				break
 			case "asksage":
 				if (!apiConfiguration.asksageApiKey) {
 					return "You must provide a valid API key or choose a different provider."
+				}
+				break
+			case "sambanova":
+				if (!apiConfiguration.sambanovaApiKey) {
+					return "You must provide a valid API key or choose a different provider."
+				}
+				break
+			case "sapaicore":
+				if (!apiConfiguration.sapAiCoreBaseUrl) {
+					return "You must provide a valid Base URL key or choose a different provider."
+				}
+				if (!apiConfiguration.sapAiCoreClientId) {
+					return "You must provide a valid Client Id or choose a different provider."
+				}
+				if (!apiConfiguration.sapAiCoreClientSecret) {
+					return "You must provide a valid Client Secret or choose a different provider."
+				}
+				if (!apiConfiguration.sapAiCoreTokenUrl) {
+					return "You must provide a valid Auth URL or choose a different provider."
 				}
 				break
 		}

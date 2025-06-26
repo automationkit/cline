@@ -1,19 +1,18 @@
-import { ModelInfo } from "../../shared/api"
-import { convertToOpenAiMessages } from "./openai-format"
-import { convertToR1Format } from "./r1-format"
-import { ApiStream, ApiStreamChunk } from "./stream"
+import { ModelInfo } from "@shared/api"
+import { convertToOpenAiMessages } from "@api/transform/openai-format"
+import { convertToR1Format } from "@api/transform/r1-format"
 import { Anthropic } from "@anthropic-ai/sdk"
 import OpenAI from "openai"
-import { OpenRouterErrorResponse } from "../providers/types"
 
-export async function* streamOpenRouterFormatRequest(
+export async function createOpenRouterStream(
 	client: OpenAI,
 	systemPrompt: string,
 	messages: Anthropic.Messages.MessageParam[],
 	model: { id: string; info: ModelInfo },
-	o3MiniReasoningEffort?: string,
+	reasoningEffort?: string,
 	thinkingBudgetTokens?: number,
-): AsyncGenerator<ApiStreamChunk, string | undefined, unknown> {
+	openRouterProviderSorting?: string,
+) {
 	// Convert Anthropic messages to OpenAI format
 	let openAiMessages: OpenAI.Chat.ChatCompletionMessageParam[] = [
 		{ role: "system", content: systemPrompt },
@@ -21,8 +20,11 @@ export async function* streamOpenRouterFormatRequest(
 	]
 
 	// prompt caching: https://openrouter.ai/docs/prompt-caching
-	// this is specifically for claude models (some models may 'support prompt caching' automatically without this)
+	// this was initially specifically for claude models (some models may 'support prompt caching' automatically without this)
+	// handles direct model.id match logic
 	switch (model.id) {
+		case "anthropic/claude-sonnet-4":
+		case "anthropic/claude-opus-4":
 		case "anthropic/claude-3.7-sonnet":
 		case "anthropic/claude-3.7-sonnet:beta":
 		case "anthropic/claude-3.7-sonnet:thinking":
@@ -79,6 +81,8 @@ export async function* streamOpenRouterFormatRequest(
 	// (models usually default to max tokens allowed)
 	let maxTokens: number | undefined
 	switch (model.id) {
+		case "anthropic/claude-sonnet-4":
+		case "anthropic/claude-opus-4":
 		case "anthropic/claude-3.7-sonnet":
 		case "anthropic/claude-3.7-sonnet:beta":
 		case "anthropic/claude-3.7-sonnet:thinking":
@@ -98,7 +102,12 @@ export async function* streamOpenRouterFormatRequest(
 
 	let temperature: number | undefined = 0
 	let topP: number | undefined = undefined
-	if (model.id.startsWith("deepseek/deepseek-r1") || model.id === "perplexity/sonar-reasoning") {
+	if (
+		model.id.startsWith("deepseek/deepseek-r1") ||
+		model.id === "perplexity/sonar-reasoning" ||
+		model.id === "qwen/qwq-32b:free" ||
+		model.id === "qwen/qwq-32b"
+	) {
 		// Recommended values from DeepSeek
 		temperature = 0.7
 		topP = 0.95
@@ -107,6 +116,8 @@ export async function* streamOpenRouterFormatRequest(
 
 	let reasoning: { max_tokens: number } | undefined = undefined
 	switch (model.id) {
+		case "anthropic/claude-sonnet-4":
+		case "anthropic/claude-opus-4":
 		case "anthropic/claude-3.7-sonnet":
 		case "anthropic/claude-3.7-sonnet:beta":
 		case "anthropic/claude-3.7-sonnet:thinking":
@@ -136,45 +147,13 @@ export async function* streamOpenRouterFormatRequest(
 		top_p: topP,
 		messages: openAiMessages,
 		stream: true,
+		stream_options: { include_usage: true },
 		transforms: shouldApplyMiddleOutTransform ? ["middle-out"] : undefined,
 		include_reasoning: true,
-		...(model.id === "openai/o3-mini" ? { reasoning_effort: o3MiniReasoningEffort || "medium" } : {}),
+		...(model.id.startsWith("openai/o") ? { reasoning_effort: reasoningEffort || "medium" } : {}),
 		...(reasoning ? { reasoning } : {}),
+		...(openRouterProviderSorting ? { provider: { sort: openRouterProviderSorting } } : {}),
 	})
 
-	let genId: string | undefined
-
-	for await (const chunk of stream) {
-		// openrouter returns an error object instead of the openai sdk throwing an error
-		if ("error" in chunk) {
-			const error = chunk.error as OpenRouterErrorResponse["error"]
-			console.error(`OpenRouter API Error: ${error?.code} - ${error?.message}`)
-			// Include metadata in the error message if available
-			const metadataStr = error.metadata ? `\nMetadata: ${JSON.stringify(error.metadata, null, 2)}` : ""
-			throw new Error(`OpenRouter API Error ${error.code}: ${error.message}${metadataStr}`)
-		}
-
-		if (!genId && chunk.id) {
-			genId = chunk.id
-		}
-
-		const delta = chunk.choices[0]?.delta
-		if (delta?.content) {
-			yield {
-				type: "text",
-				text: delta.content,
-			}
-		}
-
-		// Reasoning tokens are returned separately from the content
-		if ("reasoning" in delta && delta.reasoning) {
-			yield {
-				type: "reasoning",
-				// @ts-ignore-next-line
-				reasoning: delta.reasoning,
-			}
-		}
-	}
-
-	return genId
+	return stream
 }

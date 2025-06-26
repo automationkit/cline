@@ -2,9 +2,9 @@ import fs from "fs/promises"
 import * as path from "path"
 import simpleGit from "simple-git"
 import * as vscode from "vscode"
-import { HistoryItem } from "../../shared/HistoryItem"
+import { telemetryService } from "@/services/posthog/telemetry/TelemetryService"
 import { GitOperations } from "./CheckpointGitOperations"
-import { getShadowGitPath, hashWorkingDir, getWorkingDirectory } from "./CheckpointUtils"
+import { getShadowGitPath, getWorkingDirectory, hashWorkingDir } from "./CheckpointUtils"
 
 /**
  * CheckpointTracker Module
@@ -33,9 +33,9 @@ import { getShadowGitPath, hashWorkingDir, getWorkingDirectory } from "./Checkpo
  * - Handles cleanup and resource disposal
  *
  * Checkpoint Architecture:
- * - Uses a branch-per-task model to consolidate shadow git repositories
- * - Each task gets its own branch within a single shadow git per workspace
- * - Automatically cleans up by deleting task branches when tasks are removed
+ * - Unique shadow git repository for each workspace
+ * - Workspaces are identified by name, and hashed to a unique number
+ * - All commits for a workspace are stored in one shadow git, under a single branch
  */
 
 class CheckpointTracker {
@@ -45,6 +45,14 @@ class CheckpointTracker {
 	private cwdHash: string
 	private lastRetrievedShadowGitConfigWorkTree?: string
 	private gitOperations: GitOperations
+
+	/**
+	 * Helper method to clean commit hashes that might have a "HEAD " prefix.
+	 * Used for backward compatibility with old tasks that stored hashes with the prefix.
+	 */
+	private cleanCommitHash(hash: string): string {
+		return hash.startsWith("HEAD ") ? hash.slice(5) : hash
+	}
 
 	/**
 	 * Creates a new CheckpointTracker instance to manage checkpoints for a specific task.
@@ -64,7 +72,7 @@ class CheckpointTracker {
 
 	/**
 	 * Creates a new CheckpointTracker instance for tracking changes in a task.
-	 * Handles initialization of the shadow git repository and branch setup.
+	 * Handles initialization of the shadow git repository.
 	 *
 	 * @param taskId - Unique identifier for the task to track
 	 * @param globalStoragePath - the globalStorage path
@@ -78,22 +86,25 @@ class CheckpointTracker {
 	 * Key operations:
 	 * - Validates git installation and settings
 	 * - Creates/initializes shadow git repository
-	 * - Sets up task-specific branch for new checkpoints
 	 *
 	 * Configuration:
 	 * - Respects 'cline.enableCheckpoints' VS Code setting
-	 * - Uses branch-per-task architecture for new checkpoints
 	 */
-	public static async create(taskId: string, globalStoragePath: string | undefined): Promise<CheckpointTracker | undefined> {
+	public static async create(
+		taskId: string,
+		globalStoragePath: string | undefined,
+		enableCheckpointsSetting: boolean,
+	): Promise<CheckpointTracker | undefined> {
 		if (!globalStoragePath) {
 			throw new Error("Global storage path is required to create a checkpoint tracker")
 		}
 		try {
 			console.info(`Creating new CheckpointTracker for task ${taskId}`)
+			const startTime = performance.now()
 
-			// Check if checkpoints are disabled in VS Code settings
-			const enableCheckpoints = vscode.workspace.getConfiguration("cline").get<boolean>("enableCheckpoints") ?? true
-			if (!enableCheckpoints) {
+			// Check if checkpoints are disabled by setting
+			if (!enableCheckpointsSetting) {
+				console.info(`Checkpoints disabled by setting for task ${taskId}`)
 				return undefined // Don't create tracker when disabled
 			}
 
@@ -110,10 +121,12 @@ class CheckpointTracker {
 
 			const newTracker = new CheckpointTracker(globalStoragePath, taskId, workingDir, cwdHash)
 
-			// Branch-per-task structure
 			const gitPath = await getShadowGitPath(newTracker.globalStoragePath, newTracker.taskId, newTracker.cwdHash)
-			await newTracker.gitOperations.initShadowGit(gitPath, workingDir)
-			await newTracker.gitOperations.switchToTaskBranch(newTracker.taskId, gitPath)
+			await newTracker.gitOperations.initShadowGit(gitPath, workingDir, taskId)
+
+			const durationMs = Math.round(performance.now() - startTime)
+			telemetryService.captureCheckpointUsage(taskId, "shadow_git_initialized", durationMs)
+
 			return newTracker
 		} catch (error) {
 			console.error("Failed to create CheckpointTracker:", error)
@@ -126,48 +139,54 @@ class CheckpointTracker {
 	 *
 	 * Key behaviors:
 	 * - Creates commit with checkpoint files in shadow git repo
-	 * - For new tasks, switches to task-specific branch first
 	 * - Caches the created commit hash
 	 *
 	 * Commit structure:
-	 * - Branch-per-task: "checkpoint-{cwdHash}-{taskId}"
+	 * - Commit message: "checkpoint-{cwdHash}-{taskId}"
 	 * - Always allows empty commits
 	 *
 	 * Dependencies:
 	 * - Requires initialized shadow git (getShadowGitPath)
-	 * - For new checkpoints, requires task branch setup
 	 * - Uses addCheckpointFiles to stage changes using 'git add .'
 	 * - Relies on git's native exclusion handling via the exclude file
 	 *
 	 * @returns Promise<string | undefined> The created commit hash, or undefined if:
 	 * - Shadow git access fails
-	 * - Branch switch fails
 	 * - Staging files fails
 	 * - Commit creation fails
 	 * @throws Error if unable to:
 	 * - Access shadow git path
 	 * - Initialize simple-git
-	 * - Switch branches
 	 * - Stage or commit files
 	 */
 	public async commit(): Promise<string | undefined> {
 		try {
 			console.info(`Creating new checkpoint commit for task ${this.taskId}`)
+			const startTime = performance.now()
+
 			const gitPath = await getShadowGitPath(this.globalStoragePath, this.taskId, this.cwdHash)
 			const git = simpleGit(path.dirname(gitPath))
 
 			console.info(`Using shadow git at: ${gitPath}`)
 
-			await this.gitOperations.addCheckpointFiles(git)
+			const addFilesResult = await this.gitOperations.addCheckpointFiles(git)
+			if (!addFilesResult.success) {
+				console.error("Failed to add at least one file(s) to checkpoints shadow git")
+			}
 
 			const commitMessage = "checkpoint-" + this.cwdHash + "-" + this.taskId
 
 			console.info(`Creating checkpoint commit with message: ${commitMessage}`)
 			const result = await git.commit(commitMessage, {
 				"--allow-empty": null,
+				"--no-verify": null,
 			})
-			const commitHash = result.commit || ""
-			console.warn(`Checkpoint commit created.`)
+			const commitHash = (result.commit || "").replace(/^HEAD\s+/, "")
+			console.warn(`Checkpoint commit created: `, commitHash)
+
+			const durationMs = Math.round(performance.now() - startTime)
+			telemetryService.captureCheckpointUsage(this.taskId, "commit_created", durationMs)
+
 			return commitHash
 		} catch (error) {
 			console.error("Failed to create checkpoint:", {
@@ -222,7 +241,6 @@ class CheckpointTracker {
 	 *
 	 * Dependencies:
 	 * - Requires initialized shadow git (getShadowGitPath)
-	 * - For new checkpoints, requires task branch setup
 	 * - Must be called with a valid commit hash from this task's history
 	 *
 	 * @param commitHash - The hash of the checkpoint commit to reset to
@@ -230,17 +248,20 @@ class CheckpointTracker {
 	 * @throws Error if unable to:
 	 * - Access shadow git path
 	 * - Initialize simple-git
-	 * - Switch to task branch
 	 * - Reset to target commit
 	 */
 	public async resetHead(commitHash: string): Promise<void> {
 		console.info(`Resetting to checkpoint: ${commitHash}`)
+		const startTime = performance.now()
+
 		const gitPath = await getShadowGitPath(this.globalStoragePath, this.taskId, this.cwdHash)
 		const git = simpleGit(path.dirname(gitPath))
 		console.debug(`Using shadow git at: ${gitPath}`)
-		await this.gitOperations.switchToTaskBranch(this.taskId, gitPath)
-		await git.reset(["--hard", commitHash]) // Hard reset to target commit
+		await git.reset(["--hard", this.cleanCommitHash(commitHash)]) // Hard reset to target commit
 		console.debug(`Successfully reset to checkpoint: ${commitHash}`)
+
+		const durationMs = Math.round(performance.now() - startTime)
+		telemetryService.captureCheckpointUsage(this.taskId, "restored", durationMs)
 	}
 
 	/**
@@ -257,7 +278,7 @@ class CheckpointTracker {
 	 * @returns Array of file changes with before/after content
 	 */
 	public async getDiffSet(
-		lhsHash?: string,
+		lhsHash: string,
 		rhsHash?: string,
 	): Promise<
 		Array<{
@@ -267,40 +288,18 @@ class CheckpointTracker {
 			after: string
 		}>
 	> {
+		const startTime = performance.now()
+
 		const gitPath = await getShadowGitPath(this.globalStoragePath, this.taskId, this.cwdHash)
 		const git = simpleGit(path.dirname(gitPath))
 
 		console.info(`Getting diff between commits: ${lhsHash || "initial"} -> ${rhsHash || "working directory"}`)
 
-		// If lhsHash is missing, iteratively check up to 5 commits to find the first one with tracked files
-		let baseHash = lhsHash
-		if (!baseHash) {
-			// Ensure we're on the correct task branch before getting commits
-			await this.gitOperations.switchToTaskBranch(this.taskId, gitPath)
-
-			// Verify which branch we're on after switching
-			const currentBranch = await git.revparse(["--abbrev-ref", "HEAD"])
-			console.info(`Getting commits from branch: ${currentBranch}`)
-
-			try {
-				// Get all commits that match the checkpoint pattern for this specific task
-				const commitPattern = `checkpoint-${this.cwdHash}-${this.taskId}`
-				const branchCommits = await git.log(["--grep", commitPattern, "--reverse"])
-				if (!branchCommits.all.length) {
-					throw new Error("No commits found in the branch.")
-				}
-				// Get the first commit that matches our task's checkpoint pattern
-				baseHash = branchCommits.all[0].hash
-			} catch (error) {
-				console.error("Failed to get branch commits:", error)
-				throw new Error("Failed to determine branch history")
-			}
-		}
-
 		// Stage all changes so that untracked files appear in diff summary
 		await this.gitOperations.addCheckpointFiles(git)
 
-		const diffRange = rhsHash ? `${baseHash}..${rhsHash}` : baseHash
+		const cleanRhs = rhsHash ? this.cleanCommitHash(rhsHash) : undefined
+		const diffRange = cleanRhs ? `${this.cleanCommitHash(lhsHash)}..${cleanRhs}` : this.cleanCommitHash(lhsHash)
 		console.info(`Diff range: ${diffRange}`)
 		const diffSummary = await git.diffSummary([diffRange])
 
@@ -311,7 +310,7 @@ class CheckpointTracker {
 
 			let beforeContent = ""
 			try {
-				beforeContent = await git.show([`${baseHash}:${filePath}`])
+				beforeContent = await git.show([`${this.cleanCommitHash(lhsHash)}:${filePath}`])
 			} catch (_) {
 				// file didn't exist in older commit => remains empty
 			}
@@ -319,7 +318,7 @@ class CheckpointTracker {
 			let afterContent = ""
 			if (rhsHash) {
 				try {
-					afterContent = await git.show([`${rhsHash}:${filePath}`])
+					afterContent = await git.show([`${this.cleanCommitHash(rhsHash)}:${filePath}`])
 				} catch (_) {
 					// file didn't exist in newer commit => remains empty
 				}
@@ -339,22 +338,39 @@ class CheckpointTracker {
 			})
 		}
 
+		const durationMs = Math.round(performance.now() - startTime)
+		telemetryService.captureCheckpointUsage(this.taskId, "diff_generated", durationMs)
+
 		return result
 	}
 
 	/**
-	 * Deletes all checkpoint data for a given task.
+	 * Returns the number of files changed between two commits.
 	 *
-	 * @param taskId - The ID of the task whose checkpoints should be deleted
-	 * @param historyItem - The history item containing the shadow git config for this task
-	 * @param globalStoragePath - the globalStorage path
-	 * @throws Error if deletion fails
+	 * @param lhsHash - The commit to compare from (older commit)
+	 * @param rhsHash - The commit to compare to (newer commit).
+	 *                  If omitted, we compare to the working directory.
+	 * @returns The number of files changed between the commits
 	 */
-	public static async deleteCheckpoints(taskId: string, historyItem: HistoryItem, globalStoragePath: string): Promise<void> {
-		if (!globalStoragePath) {
-			throw new Error("Global storage uri is invalid")
-		}
-		await GitOperations.deleteTaskBranchStatic(taskId, historyItem, globalStoragePath)
+	public async getDiffCount(lhsHash: string, rhsHash?: string): Promise<number> {
+		const startTime = performance.now()
+
+		const gitPath = await getShadowGitPath(this.globalStoragePath, this.taskId, this.cwdHash)
+		const git = simpleGit(path.dirname(gitPath))
+
+		console.info(`Getting diff count between commits: ${lhsHash || "initial"} -> ${rhsHash || "working directory"}`)
+
+		// Stage all changes so that untracked files appear in diff summary
+		await this.gitOperations.addCheckpointFiles(git)
+
+		const cleanRhs = rhsHash ? this.cleanCommitHash(rhsHash) : undefined
+		const diffRange = cleanRhs ? `${this.cleanCommitHash(lhsHash)}..${cleanRhs}` : this.cleanCommitHash(lhsHash)
+		const diffSummary = await git.diffSummary([diffRange])
+
+		const durationMs = Math.round(performance.now() - startTime)
+		telemetryService.captureCheckpointUsage(this.taskId, "diff_generated", durationMs)
+
+		return diffSummary.files.length
 	}
 }
 

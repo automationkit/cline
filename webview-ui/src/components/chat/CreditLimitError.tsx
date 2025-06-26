@@ -1,8 +1,8 @@
-import React from "react"
-import VSCodeButtonLink from "../common/VSCodeButtonLink"
+import VSCodeButtonLink from "@/components/common/VSCodeButtonLink"
+import { TaskServiceClient } from "@/services/grpc-client"
+import { AskResponseRequest } from "@shared/proto/task"
 import { VSCodeButton } from "@vscode/webview-ui-toolkit/react"
-import { vscode } from "../../utils/vscode"
-import { Invoke } from "../../../../src/shared/ExtensionMessage"
+import React from "react"
 
 interface CreditLimitErrorProps {
 	currentBalance: number
@@ -30,7 +30,7 @@ const CreditLimitError: React.FC<CreditLimitErrorProps> = ({ currentBalance, tot
 			</div>
 
 			<VSCodeButtonLink
-				href="https://app.cline.bot/credits"
+				href="https://app.cline.bot/credits/#buy"
 				style={{
 					width: "100%",
 					marginBottom: "8px",
@@ -40,11 +40,18 @@ const CreditLimitError: React.FC<CreditLimitErrorProps> = ({ currentBalance, tot
 			</VSCodeButtonLink>
 
 			<VSCodeButton
-				onClick={() => {
-					vscode.postMessage({
-						type: "invoke",
-						text: "primaryButtonClick" satisfies Invoke,
-					})
+				onClick={async () => {
+					try {
+						await TaskServiceClient.askResponse(
+							AskResponseRequest.create({
+								responseType: "yesButtonClicked",
+								text: "",
+								images: [],
+							}),
+						)
+					} catch (error) {
+						console.error("Error invoking action:", error)
+					}
 				}}
 				appearance="secondary"
 				style={{

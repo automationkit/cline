@@ -1,10 +1,20 @@
 import { Anthropic } from "@anthropic-ai/sdk"
 import OpenAI from "openai"
 import { ApiHandler } from "../"
-import { ApiHandlerOptions, QwenModelId, ModelInfo, qwenDefaultModelId, qwenModels } from "../../shared/api"
+import {
+	ApiHandlerOptions,
+	ModelInfo,
+	mainlandQwenModels,
+	internationalQwenModels,
+	mainlandQwenDefaultModelId,
+	internationalQwenDefaultModelId,
+	MainlandQwenModelId,
+	InternationalQwenModelId,
+} from "@shared/api"
 import { convertToOpenAiMessages } from "../transform/openai-format"
 import { ApiStream } from "../transform/stream"
 import { convertToR1Format } from "../transform/r1-format"
+import { withRetry } from "../retry"
 
 export class QwenHandler implements ApiHandler {
 	private options: ApiHandlerOptions
@@ -21,35 +31,59 @@ export class QwenHandler implements ApiHandler {
 		})
 	}
 
-	getModel(): { id: QwenModelId; info: ModelInfo } {
+	getModel(): { id: MainlandQwenModelId | InternationalQwenModelId; info: ModelInfo } {
 		const modelId = this.options.apiModelId
-		if (modelId && modelId in qwenModels) {
-			const id = modelId as QwenModelId
-			return { id, info: qwenModels[id] }
-		}
-		return {
-			id: qwenDefaultModelId,
-			info: qwenModels[qwenDefaultModelId],
+		// Branch based on API line to let poor typescript know what to do
+		if (this.options.qwenApiLine === "china") {
+			return {
+				id: (modelId as MainlandQwenModelId) ?? mainlandQwenDefaultModelId,
+				info: mainlandQwenModels[modelId as MainlandQwenModelId] ?? mainlandQwenModels[mainlandQwenDefaultModelId],
+			}
+		} else {
+			return {
+				id: (modelId as InternationalQwenModelId) ?? internationalQwenDefaultModelId,
+				info:
+					internationalQwenModels[modelId as InternationalQwenModelId] ??
+					internationalQwenModels[internationalQwenDefaultModelId],
+			}
 		}
 	}
 
+	@withRetry()
 	async *createMessage(systemPrompt: string, messages: Anthropic.Messages.MessageParam[]): ApiStream {
 		const model = this.getModel()
 		const isDeepseekReasoner = model.id.includes("deepseek-r1")
+		const isReasoningModelFamily = model.id.includes("qwen3") || ["qwen-plus-latest", "qwen-turbo-latest"].includes(model.id)
+
 		let openAiMessages: OpenAI.Chat.ChatCompletionMessageParam[] = [
 			{ role: "system", content: systemPrompt },
 			...convertToOpenAiMessages(messages),
 		]
-		if (isDeepseekReasoner) {
+
+		let temperature: number | undefined = 0
+		// Configuration for extended thinking
+		const budgetTokens = this.options.thinkingBudgetTokens || 0
+		const reasoningOn = budgetTokens !== 0 ? true : false
+		const thinkingArgs = isReasoningModelFamily
+			? {
+					enable_thinking: reasoningOn,
+					thinking_budget: reasoningOn ? budgetTokens : undefined,
+				}
+			: undefined
+
+		if (isDeepseekReasoner || (reasoningOn && isReasoningModelFamily)) {
 			openAiMessages = convertToR1Format([{ role: "user", content: systemPrompt }, ...messages])
+			temperature = undefined
 		}
+
 		const stream = await this.client.chat.completions.create({
 			model: model.id,
 			max_completion_tokens: model.info.maxTokens,
 			messages: openAiMessages,
 			stream: true,
 			stream_options: { include_usage: true },
-			...(model.id === "deepseek-r1" ? {} : { temperature: 0 }),
+			temperature,
+			...thinkingArgs,
 		})
 
 		for await (const chunk of stream) {
